@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/Microsoft/go-winio"
@@ -43,7 +44,7 @@ func QueryAgent(pipeName string, buf []byte) (result []byte, err error) {
 	// <https://github.com/openssh/openssh-portable/blob/4e636cf/PROTOCOL.agent>
 	// first 4 bytes are messageSizeBuf uint32
 	messageSizeBuf := make([]byte, 4)
-	_, err = conn.Read(messageSizeBuf)
+	_, err = io.ReadFull(conn, messageSizeBuf)
 	if err != nil {
 		switch {
 		case errors.Is(err, winio.ErrTimeout):
@@ -55,9 +56,13 @@ func QueryAgent(pipeName string, buf []byte) (result []byte, err error) {
 	}
 	messageSize := binary.BigEndian.Uint32(messageSizeBuf)
 
+	if messageSize < 1 || messageSize > AgentMaxMessageLength {
+		return genericFail, nil
+	}
+
 	// next byte is the reply type code
 	replyCode := make([]byte, 1)
-	_, err = conn.Read(replyCode)
+	_, err = io.ReadFull(conn, replyCode)
 	if err != nil {
 		fmt.Printf("Cannot read message type from pipe %s: %s\n", pipeName, err.Error())
 		return append(messageSizeBuf, SSH_AGENT_FAIL), nil
@@ -68,7 +73,7 @@ func QueryAgent(pipeName string, buf []byte) (result []byte, err error) {
 
 	// https://datatracker.ietf.org/doc/html/draft-miller-ssh-agent-04#section-3
 	messageContents := make([]byte, messageSize-1)
-	_, err = conn.Read(messageContents)
+	_, err = io.ReadFull(conn, messageContents)
 	if err != nil {
 		fmt.Printf("cannot read message contents from pipe %s: %s\n", pipeName, err.Error())
 		return append(messageSizeBuf, SSH_AGENT_FAIL), nil

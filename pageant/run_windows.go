@@ -59,6 +59,7 @@ func (p *Pageant) Run() {
 	}
 
 	hglobal := win.GlobalAlloc(0, unsafe.Sizeof(win.MSG{}))
+	defer win.GlobalFree(hglobal)
 	//nolint:gosec
 	msg := (*win.MSG)(unsafe.Pointer(hglobal))
 
@@ -67,9 +68,6 @@ func (p *Pageant) Run() {
 		win.TranslateMessage(msg)
 		win.DispatchMessage(msg)
 	}
-
-	// Explicitly release the global memory handle
-	win.GlobalFree(hglobal)
 }
 
 const (
@@ -107,7 +105,8 @@ func openFileMap(dwDesiredAccess, bInheritHandle uint32, mapNamePtr uintptr) (wi
 	mapPtr, _, err := procOpenFileMappingA.Call(uintptr(dwDesiredAccess), uintptr(bInheritHandle), mapNamePtr)
 
 	//Properly compare syscall.Errno to number, instead of naive (i18n-unaware) string comparison
-	if err.(syscall.Errno) == windows.ERROR_SUCCESS {
+	errno, ok := err.(syscall.Errno)
+	if ok && errno == windows.ERROR_SUCCESS {
 		err = nil
 	}
 	return windows.Handle(mapPtr), err
@@ -172,9 +171,35 @@ func (p *Pageant) wndProc(hWnd win.HWND, message uint32, wParam uintptr, lParam 
 				return 0
 			}
 
-			fileMap, err := openFileMap(FILE_MAP_ALL_ACCESS, 0, copyData.lpData)
+			// 1. Validate the size of the incoming string data (map name).
+			// Pageant map names are typically ~24 characters. Max path is 260.
+			if copyData.cbData == 0 || copyData.cbData > 260 {
+				log.Println("WM_COPYDATA cbData size out of bounds")
+				return 0
+			}
+
+			if copyData.lpData == 0 {
+				log.Println("WM_COPYDATA lpData is null")
+				return 0
+			}
+
+			// 2. Create a bounded slice using the exact size provided by the OS
+			mapNameSlice := unsafe.Slice((*byte)(unsafe.Pointer(copyData.lpData)), copyData.cbData)
+
+			// 3. Convert to a Go string, safely stripping any trailing null bytes or garbage
+			mapNameStr := strings.TrimRight(string(mapNameSlice), "\x00")
+
+			// 4. Safely create a guaranteed null-terminated byte pointer for OpenFileMappingA
+			mapNamePtr, err := windows.BytePtrFromString(mapNameStr)
 			if err != nil {
-				log.Println(err)
+				log.Println("Invalid map name format:", err)
+				return 0
+			}
+
+			// 5. Pass our safely bounded and explicitly null-terminated pointer instead of lpData
+			fileMap, err := openFileMap(FILE_MAP_ALL_ACCESS, 0, uintptr(unsafe.Pointer(mapNamePtr)))
+			if err != nil {
+				log.Println("openFileMap failed:", err)
 				return 0
 			}
 			defer windows.CloseHandle(fileMap)
@@ -207,27 +232,55 @@ func (p *Pageant) wndProc(hWnd win.HWND, message uint32, wParam uintptr, lParam 
 			}
 			defer windows.UnmapViewOfFile(sharedMemory)
 
-			sharedMemoryArray := (*[openssh.AgentMaxMessageLength]byte)(unsafe.Pointer(sharedMemory))
-
-			size := binary.BigEndian.Uint32(sharedMemoryArray[:4]) + 4 // +4 for the size uint itself
-			if size > openssh.AgentMaxMessageLength {
+			// 1. Query the actual size of the mapped memory region to prevent Out-Of-Bounds (OOB) access
+			var mbi windows.MemoryBasicInformation
+			err = windows.VirtualQuery(sharedMemory, &mbi, unsafe.Sizeof(mbi))
+			if err != nil {
+				log.Println("VirtualQuery failed:", err)
 				return 0
 			}
 
-			// Query the windows OpenSSH agent via the windows named pipe
-			result, err := p.PageantRequestHandler(p, sharedMemoryArray[:size])
+			// 2. Ensure the region is large enough to at least hold the 4-byte size header
+			if mbi.RegionSize < 4 {
+				log.Println("Mapped file is too small for a size header")
+				return 0
+			}
+
+			// 3. Create a safe slice strictly bounded by the OS-reported region size
+			mappedSlice := unsafe.Slice((*byte)(unsafe.Pointer(sharedMemory)), mbi.RegionSize)
+
+			// 4. Safely read the size requested by the client
+			msgSize := binary.BigEndian.Uint32(mappedSlice[:4])
+			totalSize := uint64(msgSize) + 4 // +4 to account for the size uint itself
+
+			// 5. Strict bounds checking
+			if totalSize > openssh.AgentMaxMessageLength {
+				log.Println("Declared message size exceeds application maximum")
+				return 0
+			}
+			if uintptr(totalSize) > mbi.RegionSize {
+				log.Println("Declared message size exceeds actual mapped memory")
+				return 0
+			}
+
+			// 6. Query the windows OpenSSH agent via the windows named pipe
+			result, err := p.PageantRequestHandler(p, mappedSlice[:totalSize])
 			if err != nil {
 				log.Printf("Error in PageantRequestHandler: %+v\n", err)
 				return 0
 			}
-			copy(sharedMemoryArray[:], result)
 
-			// success, explicitly Clean up some resources (better to be certain it get's GC'd)
-			ourself = nil
-			ourself2 = nil
-			mapOwner = nil
-			sharedMemoryArray = nil
-			result = nil
+			// 7. Ensure we do not write out-of-bounds when copying the result back
+			if uintptr(len(result)) > mbi.RegionSize {
+				log.Println("Result payload exceeds mapped memory size")
+				return 0
+			}
+
+			// Safely copy the result into the mapped memory slice
+			copy(mappedSlice, result)
+
+			// Zero-out the result buffer
+			clear(result)
 
 			return 1
 		}
@@ -267,9 +320,13 @@ func (p *Pageant) pipeProxy() {
 		log.Println(err)
 	}
 
-	namePart := strings.Split(currentUser.Username, `\`)[1]
+	parts := strings.Split(currentUser.Username, `\`)
+	namePart := parts[len(parts)-1] // Gets the last item safely
 	pipeName := fmt.Sprintf(agentPipeName, namePart, capiObfuscateString(wndClassName))
-	listener, err := winio.ListenPipe(pipeName, nil)
+	config := &winio.PipeConfig{
+		SecurityDescriptor: "D:(A;;GA;;;OW)", // Generic All to Owner only
+	}
+	listener, err := winio.ListenPipe(pipeName, config)
 	if err != nil {
 		log.Println(err)
 	} else {
@@ -298,6 +355,9 @@ func (p *Pageant) pipeListen(pageantConn net.Conn) {
 		}
 
 		bufferLen := binary.BigEndian.Uint32(lenBuf)
+		if bufferLen > openssh.AgentMaxMessageLength {
+			return // Reject and close connection
+		}
 		readBuf := make([]byte, bufferLen)
 		_, err = io.ReadFull(reader, readBuf)
 		if err != nil {
