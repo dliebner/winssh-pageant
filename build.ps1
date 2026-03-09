@@ -82,7 +82,7 @@ Foreach ($arch in $Architectures)
     if ($Release)
     {
         $buildDir = PrepareBuildDir $outDir $arch
-        $buildFlags = "-ldflags=""-w -s -H=windowsgui"" -trimpath"
+        $buildFlags = "-ldflags=""-w -s"" -trimpath"
         $binary = "winssh-pageant.exe"
     } else {
         $buildDir = $outDir
